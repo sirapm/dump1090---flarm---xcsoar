@@ -1,5 +1,5 @@
 """
-Version 0.8
+Version 0.7
 Info to come
 
 For this to work, you need:
@@ -504,3 +504,7 @@ while True:
         #sendPFLAA()
         if not adsbConnected:
             xcsoaru2000.sendto(("Waiting for adsb data. No connection."+'\r\n').encode(),(XCHost, XCPort))
+
+
+
+
