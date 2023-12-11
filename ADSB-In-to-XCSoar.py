@@ -1,11 +1,16 @@
 """
-INfo to come
+Version 0.8
+Info to come
 
-For this to work, you need a:
-    * rtl-sdr dongle.
-    * GPS
+For this to work, you need:
+    * rtl-sdr dongle with functioning dump1090-mutability.service
+    * usb serial GPS
 it is recommended to create a udevd rule with an alias as the serial
 port can change depending on order Linux is discovering usb serial ports.
+/etc/udev/rules.d/gps.rules
+KERNEL=="ttyACM*", ATTRS{product}=="*GPS*Receiver*", SYMLINK+="ttyACM_GPS", RUN+="/bin/stty -F /dev/ttyACM_GPS 38400 raw -echo"
+
+configure XCSoar to listen on device udp port 2000 generic
 
 """
 
@@ -19,6 +24,7 @@ from geopy import distance
 from geographiclib.geodesic import Geodesic
 import math
 import serial
+import time
 
 #Add IACO codes you do not want to show up. Typically your own transponder.
 IgnoreMyID=["B80897","OGN123", "ZZZZZ"]
@@ -34,7 +40,7 @@ LASTSEEN={}
 FLARMDATA={}
 FLARMLIST=[]
 GPSTime="2000-01-01 00:00:00"
-Testdata=True
+Testdata=False
 LastCurrentTime=""
 
 #Specify what ip address and port dump1090-mutability is running on
@@ -50,21 +56,24 @@ MaxTrackDistance=10000
 Alert1Distance=300
 Alert2Distance=150
 Alert3Distance=75
-Alert1DistancePwr=1000
+Alert1DistancePwr=900
 Alert2DistancePwr=500
 Alert3DistancePwr=300
 
 #Define how long to wait for an ADSB message of an aircraft till it is considered gone.
 MaxTimeDiff=60
 
-sp=serial.Serial(SericalPort,timeout=0.1)
+#sp=serial.Serial(SericalPort,timeout=0.1)
+sp=""
+adsb=""
 xcsoaru2000 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # UDP
+GPSConnected=False
 adsbConnected=False
 debug=True
 previous_second=""
 
 
-@dataclass(kw_only=False)
+@dataclass()
 class MSG:
     Type: str = ""
     Transmission: int = 0
@@ -95,6 +104,8 @@ class MSG:
             if not isinstance(value, field.type):
                 if value == "" and field.type == float:
                     value=0.0
+                elif value == "" and field.type == int:
+                    value=0
                 setattr(self, field.name, field.type(value))
 
 @dataclass
@@ -119,7 +130,7 @@ class PFLAU:
         return tmp+"%02x\r\n" % checksum(tmp)
     
 
-@dataclass(kw_only=False)
+@dataclass()
 class PFLAA:
     AlarmLevel: int = 0
     RelativeNorth: int = 0
@@ -164,7 +175,7 @@ class Details:
 
 
 
-def checksum(sentence):   	 
+def checksum(sentence):
     """ Remove leading $ """
     sentence = sentence.lstrip('$')
     nmeadata,cksum = re.split('\*', sentence)
@@ -214,44 +225,52 @@ def getGPSTimestamp(data):
 
 def GetGPSData():
     #Get GPS data from serial GPS
-    #print("Reading GPS")
-    try:
-        raw=sp.readall()
-    except:
-        return()
-    gpsdata=raw.decode("utf-8")
-    parts=gpsdata.split('\r\n')
-    #print(parts)
-    #print('========')
-    for part in parts:
-        #If we have gps signal, of any kind, send it to xcsoar
-        #print(part)
-        if len(part) >10:
-            xcsoaru2000.sendto((str(part)+'\r\n').encode(),(XCHost, XCPort))
-        if part[:6] == '$GPGGA':
-            MyPos(part)
-        elif part[:6] == '$GPRMC':
-            getGPSTimestamp(part)
+    global GPSConnected
+    global sp
+    if GPSConnected != True:
+        print("GPS not connected, try to connect")
+        try:
+            sp=serial.Serial(SericalPort,timeout=0.1)
+        except:
+            sp="Fail"
+        print(sp)
+        if sp != "Fail":
+            GPSConnected=True
+    if GPSConnected:
+        try:
+            raw=sp.readall()
+        except:
+            return()
+        gpsdata=raw.decode("utf-8")
+        parts=gpsdata.split('\r\n')
+        for part in parts:
+            #If we have gps signal, of any kind, send it to xcsoar
+            if len(part) >10:
+                xcsoaru2000.sendto((str(part)+'\r\n').encode(),(XCHost, XCPort))
+            if part[:6] == '$GPGGA':
+                MyPos(part)
+            elif part[:6] == '$GPRMC':
+                getGPSTimestamp(part)
 
 def LastSeen(iaco,date,time):
     #Keeping a list of all planes received with the last seen timestamp 
     lastdate=date.split('/')
     lasttime=time.split('.')[0].split(':')
-    timestamp=datetime.datetime(int(lastdate[0]),int(lastdate[1]),int(lastdate[2]),int(lasttime[0]),int(lasttime[1]),int(lasttime[2]))
+    #timestamp=datetime.datetime(int(lastdate[0]),int(lastdate[1]),int(lastdate[2]),int(lasttime[0]),int(lasttime[1]),int(lasttime[2]))
+    #ADSB time seem to be in loal timezone. A bit probelmatic so using current gps time.
+    timestamp=datetime.datetime.fromisoformat(str(GPSTime))
     LASTSEEN.update({iaco:timestamp})
+  
 
 
 def ProcessADSBData(row):
     #This function is splitting up a ADSB message and store the info in global AIRCRAFTS for each plane. Ignoring my own ADSB messages.
-    #global tmpMSG
     global AIRCRAFTS
-    #global entries
+    global LASTSEEN
     entries=row.split(',')
     #Make sure we have enough elements and icaco length is 6 char.
     if (len(entries) > 16) and (len(entries[4]) == 6) and entries[0] == 'MSG' and not entries[4] in IgnoreMyID:
-        #print(row)
         msg=MSG(*entries)
-        #print(msg)
         iaco=msg.IACO
         #if not msg.IACO in IgnoreMyID:
         tmpMSG=MSG()
@@ -259,53 +278,59 @@ def ProcessADSBData(row):
             tmpMSG=AIRCRAFTS[msg.IACO]
         except:
             tmpMSG=MSG()
+            #Set a default/initial Last seen timestamp when a new plane is discovered.
+            timestamp=datetime.datetime.fromisoformat(str(GPSTime))
+            LASTSEEN.update({iaco:timestamp})
         #When assigning the data from entries, they all seem to become strings and not numerical where they should be.
         tmpMSG=MSG(*entries[0:9]+list(astuple(tmpMSG))[9:])
         #print(tmpMSG)
         #Have seen some planes with more information than normal so if there, get the info.
         #if entries[0] == 'MSG':
-        match entries[1]:
-            case "1":
-                 tmpMSG.Callsign=msg.Callsign
-            case "3"|"4":
-                if msg.Callsign != "":
-                    tmpMSG.Callsign=entries[10]
-                if msg.Altitude != '':
-                    tmpMSG.Altitude=int(msg.Altitude)
-                if msg.GroundSpeed != '':
-                    tmpMSG.GroundSpeed=int(msg.GroundSpeed)
-                if msg.Track != '':
-                    tmpMSG.Track=int(msg.Track)
-                if msg.Latitude != '':
-                    tmpMSG.Latitude=float(msg.Latitude)
-                if msg.Longitude != '':
-                    tmpMSG.Longitude=float(msg.Longitude)
-                if msg.VerticalRate != '':
-                    tmpMSG.VerticalRate=float(msg.VerticalRate)
-                if iaco != "" and msg.Date != "" and msg.Time != "":
-                    LastSeen(iaco,msg.Date,msg.Time)
-            case "5"|"6":
-                 tmpMSG.Altitude=msg.Altitude
+        if entries[1] == "1":
+            tmpMSG.Callsign=msg.Callsign
+        elif entries[1] == "3" or entries[1] == "4":
+            #print(msg)
+            if msg.Callsign != "":
+                 tmpMSG.Callsign=entries[10]
+            if msg.Altitude != '' and msg.Altitude != 0:
+                 tmpMSG.Altitude=round(int(msg.Altitude)/3)
+            if msg.GroundSpeed != '' and msg.GroundSpeed != 0:
+                 tmpMSG.GroundSpeed=int(msg.GroundSpeed)
+            if msg.Track != '' and msg.Track != 0:
+                 tmpMSG.Track=int(msg.Track)
+            if msg.Latitude != '' and msg.Latitude != 0.0:
+                 #print("============== msg.Latitude: ",end="")
+                 #print(msg.Latitude)
+                 tmpMSG.Latitude=float(msg.Latitude)
+            if msg.Longitude != '' and msg.Longitude != 0.0:
+                 tmpMSG.Longitude=float(msg.Longitude)
+            if msg.VerticalRate != '' and msg.VerticalRate != 0.0:
+                 tmpMSG.VerticalRate=float(msg.VerticalRate)
+            if iaco != "" and msg.Date != "" and msg.Time != "":
+                 LastSeen(iaco,msg.Date,msg.Time)
+        elif entries[1] == "5" or entries[1] == "6" and msg.Altitude != 0:
+            tmpMSG.Altitude=round(int(msg.Altitude)/3)
         AIRCRAFTS.update({iaco:tmpMSG})
 
 
 
 def GetADSBData():
     global adsbConnected
+    global adsb
     #Establish connection the dump1090
     if adsbConnected != True:
+        #print("Not connected, try to connect")
         try:
-            result=s.connect((HOST, PORT))
-            #adsbConnedted=True
-            #print("Waiting for adsb data. No connection.")
+           adsb = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+           result=adsb.connect((HOST, PORT))
         except:
-            result="Fail"
+           result="Fail"
         if result != "Fail":
             adsbConnected=True
-    if adsbConnected or Testdata:
+    if adsbConnected:
         data=""
         try:
-            raw = s.recv(4096)
+            raw = adsb.recv(4096)
             data=raw.decode("utf-8")
         except:
             data=""
@@ -313,12 +338,6 @@ def GetADSBData():
         if len(data) > 75 or Testdata:
             darray=data.splitlines()
             #for each section call process line
-            if Testdata: #57.830367649297536, 11.797951228906939
-                #print("Sending testdata")
-                darray=["MSG,3,5,211,C80897,10057,2023/11/29,06:58:00.594,2023/11/29,06:58:51.153,ZKGNC,3700,111,100,57.875303,11.9,-1,,0,0,0,0",
-                        "MSG,3,5,211,BA43F5,10057,2023/11/29,06:58:00.594,2023/11/29,06:58:51.153,ANZ1,1400,111,100,57.87326,11.797,5,,0,0,0,0",
-                        "MSG,3,5,211,AABBCC,10057,2023/11/29,06:58:00.594,2023/11/29,06:58:51.153,ZKLOM,1400,111,100,57.893,11.798,3.3,,0,0,0,0"]
-            #darray=[]
             section=""
             for section in darray:
                 #print(section)
@@ -329,12 +348,10 @@ def CalcDistance():
     global DISTANCE
     #GetMyLocation()
     for plane in list(AIRCRAFTS.keys()):
-        if AIRCRAFTS[plane].Latitude > 0.0 and AIRCRAFTS[plane].Longitude > 0.0 and AIRCRAFTS[plane].Altitude > 0:
+        if float(AIRCRAFTS[plane].Latitude) != 0.0 and float(AIRCRAFTS[plane].Longitude) != 0.0:
             Lat=float(AIRCRAFTS[plane].Latitude)
             Long=float(AIRCRAFTS[plane].Longitude)
-            Altitude=int(AIRCRAFTS[plane].Altitude)
             dist=int(str(distance.distance((My.Lat,My.Long),(Lat,Long)).meters).split(".")[0])
-            #print("CalcDistance - Plane: "+plane+ " Distance: " + str(dist))
             DISTANCE.update({plane:dist})
 
 def FlarmCalc():
@@ -345,7 +362,6 @@ def FlarmCalc():
     global LASTSEEN
     global AIRCRAFTS
     FLARMDATA={}
-    #PFLAU=[0,1,2,1,0,0,0,0,0,""]
     pflau=PFLAU()
     for plane in list(AIRCRAFTS.keys()):
         #check age of plane. If old, drop it
@@ -358,7 +374,7 @@ def FlarmCalc():
         #print(last)
         if last != "":
             #WARNING: is adsb date in utc or not
-            #timediff=int(str((datetime.datetime.utcnow()-datetime.datetime.fromisoformat(str(last))).total_seconds()).split('.')[0])
+            #I see some strange date/time. For now, will change over to use GPS time rather than ADSB time.
             timediff=int(str((datetime.datetime.fromisoformat(str(GPSTime))-datetime.datetime.fromisoformat(str(last))).total_seconds()).split('.')[0])
         if timediff > MaxTimeDiff or last == "":
             if debug:
@@ -387,15 +403,14 @@ def FlarmCalc():
             pflaa.Track=AIRCRAFTS[plane].Track            
             if AIRCRAFTS[plane].Callsign != "":
                 #pflaa[ID]=AIRCRAFTS[plane][10]
-                match AIRCRAFTS[plane].Callsign[:3]:
-                    case "ZKG":
-                        pflaa.AcftType="1"
-                    case "ANZ"|"JST"|"AWK":
-                        pflaa.AcftType="9"
-                    case "ZK.":
-                        pflaa.AcftType="8"
-                    case _:
-                        pflaa.AcftType="A"
+                if "ZKG" in  AIRCRAFTS[plane].Callsign:
+                    pflaa.AcftType="1"
+                elif "ANZ" in AIRCRAFTS[plane].Callsign or "ANZ" in AIRCRAFTS[plane].Callsign or "ANZ" in AIRCRAFTS[plane].Callsign:
+                    pflaa.AcftType="9"
+                elif AIRCRAFTS[plane].Callsign.startswith("ZK"):
+                    pflaa.AcftType="8"
+                else:
+                    pflaa.AcftType="A"
             else:
                 pflaa.AcftType="A"
             if pflaa.AcftType=="1":
@@ -423,13 +438,31 @@ def FlarmCalc():
                 Lat=float(AIRCRAFTS[plane].Latitude)
                 Long=float(AIRCRAFTS[plane].Longitude)
                 pflaa.RelativeNorth=int(str(distance.distance((Lat,My.Long),(My.Lat,My.Long)).meters).split(".")[0])
+                print(AIRCRAFTS[plane].Callsign)
+                print(My.Lat)
+                print(Lat)
+                if My.Lat > Lat:
+                    pflaa.RelativeNorth=pflaa.RelativeNorth*-1
                 pflaa.RelativeEast=int(str(distance.distance((My.Lat,Long),(My.Lat,My.Long)).meters).split(".")[0])
+                if My.Long > Long:
+                    pflaa.RelativeEast = pflaa.RelativeEast * -1
+                #pflaa.RelativeNorth=int(str(distance.distance((My.Lat,My.Long),(Lat,My.Long)).meters).split(".")[0])
+                #pflaa.RelativeEast=int(str(distance.distance((My.Lat,My.Long),(My.Lat,Long)).meters).split(".")[0])
+                print("Rel north: ",end="")
+                print(pflaa.RelativeNorth)
+                print("Rel EasTh: ",end="")
+                print(pflaa.RelativeEast)
+
                 #Only add planes with coordinations or we have a python crash...
                 if AIRCRAFTS[plane].Altitude !="":
                     altdiff=int(AIRCRAFTS[plane].Altitude)-My.Alt
                 else:
                     altdiff=0
                 pflaa.RelativeVertical=altdiff
+                #print("Altitude stuff")
+                #print(My.Alt)
+                #print(AIRCRAFTS[plane].Altitude)
+                #print(altdiff)
                 #Should we have alarm level highest with least distance
                 if int(pflaa.AlarmLevel) > int(pflau.AlarmLevel) or int(DISTANCE[plane]) < int(pflau.RelativeDistance):
                     #Right order!
@@ -454,14 +487,13 @@ pflau=PFLAU()
 
 while True:
     GetADSBData()
+    time.sleep(0.001)
     #if debug:
-    #    print(".",end="")
+    #print(".",end="")
     CurrentTime=str(datetime.datetime.now())[11:19]
     if CurrentTime != LastCurrentTime:
         LastCurrentTime=CurrentTime
         GetGPSData()
-        #print('-')
-        #print(My)
         #print(AIRCRAFTS)
         CalcDistance()
         #print(DISTANCE)
@@ -472,7 +504,3 @@ while True:
         #sendPFLAA()
         if not adsbConnected:
             xcsoaru2000.sendto(("Waiting for adsb data. No connection."+'\r\n').encode(),(XCHost, XCPort))
-
-
-
-
