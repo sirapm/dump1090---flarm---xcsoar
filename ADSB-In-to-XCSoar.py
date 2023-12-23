@@ -1,11 +1,18 @@
 """
-Version 0.7.1
-Info to come
+Version 0.7.2
+This python code is reading the output from dump1090-mutability.service port 3003 if setup as per default.
+The Python code will start track all aircrafts within the range of MaxTrackDistance (in meter).
+Every second:
+    * it will read gps information, send a copy of the gps data to XCSoar and remember current position, altitude etc.
+    * calculate flarm information for tracked aircrafts
+    * drop information about aircrafts that have not been seen for MaxTimeDiff seconds
+    * generate both PFLAA and PFLAU data and send to XCSoar
 
 For this to work, you need:
     * rtl-sdr dongle with functioning dump1090-mutability.service
     * usb serial GPS
-it is recommended to create a udevd rule with an alias as the serial
+
+It is recommended to create a udevd rule with an alias as the serial
 port can change depending on order Linux is discovering usb serial ports.
 /etc/udev/rules.d/gps.rules
 KERNEL=="ttyACM*", ATTRS{product}=="*GPS*Receiver*", SYMLINK+="ttyACM_GPS", RUN+="/bin/stty -F /dev/ttyACM_GPS 38400 raw -echo"
@@ -15,6 +22,7 @@ configure XCSoar to listen on device udp port 2000 generic
 Changes:
 23-Dec-2023: Modifying Distance to include two distance values. This way we can see if an aircraft is getting closer or not.
 If getting closer, alert, if not, no alert.
+If lower or higher than MaxHightDiff meter of own aircraft, no alert.
 
 """
 
@@ -31,12 +39,12 @@ import serial
 import time
 
 #Add IACO codes you do not want to show up. Typically your own transponder.
-IgnoreMyID=["B80897","OGN123", "ZZZZZ"]
+IgnoreMyID=["C80897","ZZZZZ"]
 SericalPort='/dev/ttyACM_GPS'
 
 #Default Values
 "AIRCRAFTS = GPS MSG data"
-AIRCRAFTS={} 
+AIRCRAFTS={}
 "DISTANCE {'aircraft id':Meters} "
 DISTANCE={}
 LASTSEEN={}
@@ -48,7 +56,7 @@ Testdata=False
 LastCurrentTime=""
 
 #Specify what ip address and port dump1090-mutability is running on
-HOST = "127.0.0.1"
+HOST = "192.168.151.111"
 PORT = 30003
 #Specify udp port where XCSoar is listening on (generic)
 XCHost="127.0.0.1"
@@ -56,7 +64,7 @@ XCPort=2000
 
 #Set your limitations for Maximum distance of tracking and alarm levels based on distance
 #Pwr is powered aircrafts
-MaxTrackDistance=10000
+MaxTrackDistance=30000
 Alert1Distance=300
 Alert2Distance=150
 Alert3Distance=75
@@ -65,7 +73,8 @@ Alert2DistancePwr=500
 Alert3DistancePwr=300
 
 #Define how long to wait for an ADSB message of an aircraft till it is considered gone.
-MaxTimeDiff=60
+MaxTimeDiff=60 #Seconds
+MaxHightDiff=100 #Meters
 
 #sp=serial.Serial(SericalPort,timeout=0.1)
 sp=""
@@ -132,7 +141,7 @@ class PFLAU:
             tmp += f',{getattr(self, field.name)}'
         tmp+="*"
         return tmp+"%02x\r\n" % checksum(tmp)
-    
+
 
 @dataclass()
 class PFLAA:
@@ -158,7 +167,7 @@ class PFLAA:
             tmp += f',{getattr(self, field.name)}'
         tmp+="*"
         return tmp+"%02x\r\n" % checksum(tmp)
-        
+
 @dataclass
 class GPS:
     Long: float = 0.0
@@ -257,14 +266,14 @@ def GetGPSData():
                 getGPSTimestamp(part)
 
 def LastSeen(iaco,date,time):
-    #Keeping a list of all planes received with the last seen timestamp 
+    #Keeping a list of all planes received with the last seen timestamp
     lastdate=date.split('/')
     lasttime=time.split('.')[0].split(':')
     #timestamp=datetime.datetime(int(lastdate[0]),int(lastdate[1]),int(lastdate[2]),int(lasttime[0]),int(lasttime[1]),int(lasttime[2]))
     #ADSB time seem to be in loal timezone. A bit probelmatic so using current gps time.
     timestamp=datetime.datetime.fromisoformat(str(GPSTime))
     LASTSEEN.update({iaco:timestamp})
-  
+
 
 
 def ProcessADSBData(row):
@@ -359,7 +368,7 @@ def CalcDistance():
             try:
                 PrevDist=DISTANCE[plane]
             except:
-                PrevDist=(dist,0)
+                PrevDist=[dist,0]
             PrevDist[1]=PrevDist[0]
             PrevDist[0]=dist
             DISTANCE.update({plane:PrevDist})
@@ -392,7 +401,7 @@ def FlarmCalc():
                 print(timediff)
             if plane in LASTSEEN:
                 tmp=LASTSEEN.pop(plane)
-            if plane in AIRCRAFTS: 
+            if plane in AIRCRAFTS:
                 tmp=AIRCRAFTS.pop(plane)
             if plane in DISTANCE:
                 tmp=DISTANCE.pop(plane)
@@ -410,12 +419,12 @@ def FlarmCalc():
             pflaa.ID=plane
             pflaa.IDType=1
             pflaa.GroundSpeed=AIRCRAFTS[plane].GroundSpeed
-            pflaa.Track=AIRCRAFTS[plane].Track            
+            pflaa.Track=AIRCRAFTS[plane].Track
             if AIRCRAFTS[plane].Callsign != "":
                 #pflaa[ID]=AIRCRAFTS[plane][10]
                 if "ZKG" in  AIRCRAFTS[plane].Callsign:
                     pflaa.AcftType="1"
-                elif "ANZ" in AIRCRAFTS[plane].Callsign or "ANZ" in AIRCRAFTS[plane].Callsign or "ANZ" in AIRCRAFTS[plane].Callsign:
+                elif "ANZ" in AIRCRAFTS[plane].Callsign or "UAL" in AIRCRAFTS[plane].Callsign or AIRCRAFTS[plane].GroundSpeed > 230:
                     pflaa.AcftType="9"
                 elif AIRCRAFTS[plane].Callsign.startswith("ZK"):
                     pflaa.AcftType="8"
@@ -431,20 +440,24 @@ def FlarmCalc():
                 Alert3=Alert3DistancePwr
                 Alert2=Alert2DistancePwr
                 Alert1=Alert1DistancePwr
-            if DISTANCE[plane][0] < DISTANCE[plane][1]:
-                if int(DISTANCE[plane][0]) < Alert3:
-                    pflaa.AlarmLevel=3
-                elif int(DISTANCE[plane][0]) < Alert2:
-                    pflaa.AlarmLevel=2
-                elif int(DISTANCE[plane][0]) < Alert1:
-                    pflaa.AlarmLevel=1
+            if AIRCRAFTS[plane].Altitude > MaxHightDiff and My.Alt > (AIRCRAFTS[plane].Altitude-MaxHightDiff)  and My.Alt < (AIRCRAFTS[plane].Altitude+MaxHightDiff):
+                if DISTANCE[plane][0] < DISTANCE[plane][1]:
+                    if int(DISTANCE[plane][0]) < Alert3:
+                        pflaa.AlarmLevel=3
+                    elif int(DISTANCE[plane][0]) < Alert2:
+                        pflaa.AlarmLevel=2
+                    elif int(DISTANCE[plane][0]) < Alert1:
+                        pflaa.AlarmLevel=1
+                    else:
+                        pflaa.AlarmLevel=0
                 else:
-                    pflaa.AlarmLevel=0
+                    if int(DISTANCE[plane][0]) < Alert3:
+                        pflaa.AlarmLevel=2
+                    else:
+                        pflaa.AlarmLevel=0
             else:
-                if int(DISTANCE[plane][0]) < Alert3:
-                    pflaa.AlarmLevel=2
-                else:
-                    pflaa.AlarmLevel=0
+                pflaa.AlarmLevel=0
+
             if AIRCRAFTS[plane].VerticalRate != 0.0:
                 #Warning need to find out what the climb rate actually is!
                 pflaa.ClimbRate=round(float(AIRCRAFTS[plane].VerticalRate)/3,1)
@@ -454,9 +467,9 @@ def FlarmCalc():
                 Lat=float(AIRCRAFTS[plane].Latitude)
                 Long=float(AIRCRAFTS[plane].Longitude)
                 pflaa.RelativeNorth=int(str(distance.distance((Lat,My.Long),(My.Lat,My.Long)).meters).split(".")[0])
-                print(AIRCRAFTS[plane].Callsign)
-                print(My.Lat)
-                print(Lat)
+                #print(AIRCRAFTS[plane].Callsign)
+                #print(My.Lat)
+                #print(Lat)
                 if My.Lat > Lat:
                     pflaa.RelativeNorth=pflaa.RelativeNorth*-1
                 pflaa.RelativeEast=int(str(distance.distance((My.Lat,Long),(My.Lat,My.Long)).meters).split(".")[0])
@@ -464,11 +477,10 @@ def FlarmCalc():
                     pflaa.RelativeEast = pflaa.RelativeEast * -1
                 #pflaa.RelativeNorth=int(str(distance.distance((My.Lat,My.Long),(Lat,My.Long)).meters).split(".")[0])
                 #pflaa.RelativeEast=int(str(distance.distance((My.Lat,My.Long),(My.Lat,Long)).meters).split(".")[0])
-                print("Rel north: ",end="")
-                print(pflaa.RelativeNorth)
-                print("Rel EasTh: ",end="")
-                print(pflaa.RelativeEast)
-
+                #print("Rel north: ",end="")
+                #print(pflaa.RelativeNorth)
+                #print("Rel EasTh: ",end="")
+                #print(pflaa.RelativeEast)
                 #Only add planes with coordinations or we have a python crash...
                 if AIRCRAFTS[plane].Altitude !="":
                     altdiff=int(AIRCRAFTS[plane].Altitude)-My.Alt
@@ -495,11 +507,12 @@ def FlarmCalc():
                 FLARMDATA.update({plane:pflaa})
                 pflau.RX=len(CloseFlarm)
                 #Debug, check number of elements in PFLAU. should be 10
-#   
-# Main
-#
+
+
 My=GPS()
 pflau=PFLAU()
+
+
 while True:
     GetADSBData()
     time.sleep(0.001)
@@ -519,3 +532,5 @@ while True:
         #sendPFLAA()
         if not adsbConnected:
             xcsoaru2000.sendto(("Waiting for adsb data. No connection."+'\r\n').encode(),(XCHost, XCPort))
+
+
