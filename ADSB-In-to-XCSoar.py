@@ -1,5 +1,5 @@
 """
-Version 0.7
+Version 0.7.1
 Info to come
 
 For this to work, you need:
@@ -11,6 +11,10 @@ port can change depending on order Linux is discovering usb serial ports.
 KERNEL=="ttyACM*", ATTRS{product}=="*GPS*Receiver*", SYMLINK+="ttyACM_GPS", RUN+="/bin/stty -F /dev/ttyACM_GPS 38400 raw -echo"
 
 configure XCSoar to listen on device udp port 2000 generic
+
+Changes:
+23-Dec-2023: Modifying Distance to include two distance values. This way we can see if an aircraft is getting closer or not.
+If getting closer, alert, if not, no alert.
 
 """
 
@@ -352,7 +356,13 @@ def CalcDistance():
             Lat=float(AIRCRAFTS[plane].Latitude)
             Long=float(AIRCRAFTS[plane].Longitude)
             dist=int(str(distance.distance((My.Lat,My.Long),(Lat,Long)).meters).split(".")[0])
-            DISTANCE.update({plane:dist})
+            try:
+                PrevDist=DISTANCE[plane]
+            except:
+                PrevDist=(dist,0)
+            PrevDist[1]=PrevDist[0]
+            PrevDist[0]=dist
+            DISTANCE.update({plane:PrevDist})
 
 def FlarmCalc():
     global CloseFlarm
@@ -390,7 +400,7 @@ def FlarmCalc():
                 tmp=FLARMDATA.pop(plane)
     CloseFlarm=[]
     for plane in list(DISTANCE.keys()):
-        if DISTANCE[plane] < MaxTrackDistance:
+        if DISTANCE[plane][0] < MaxTrackDistance:
             #print("Time to do some Flarm calcs... " + plane + " Distance: "+str(DISTANCE[plane]))
             pflaa=""
             if plane in FLARMDATA:
@@ -421,14 +431,20 @@ def FlarmCalc():
                 Alert3=Alert3DistancePwr
                 Alert2=Alert2DistancePwr
                 Alert1=Alert1DistancePwr
-            if int(DISTANCE[plane]) < Alert3:
-                pflaa.AlarmLevel=3
-            elif int(DISTANCE[plane]) < Alert2:
-                pflaa.AlarmLevel=2
-            elif int(DISTANCE[plane]) < Alert1:
-                pflaa.AlarmLevel=1
+            if DISTANCE[plane][0] < DISTANCE[plane][1]:
+                if int(DISTANCE[plane][0]) < Alert3:
+                    pflaa.AlarmLevel=3
+                elif int(DISTANCE[plane][0]) < Alert2:
+                    pflaa.AlarmLevel=2
+                elif int(DISTANCE[plane][0]) < Alert1:
+                    pflaa.AlarmLevel=1
+                else:
+                    pflaa.AlarmLevel=0
             else:
-                pflaa.AlarmLevel=0
+                if int(DISTANCE[plane][0]) < Alert3:
+                    pflaa.AlarmLevel=2
+                else:
+                    pflaa.AlarmLevel=0
             if AIRCRAFTS[plane].VerticalRate != 0.0:
                 #Warning need to find out what the climb rate actually is!
                 pflaa.ClimbRate=round(float(AIRCRAFTS[plane].VerticalRate)/3,1)
@@ -464,7 +480,7 @@ def FlarmCalc():
                 #print(AIRCRAFTS[plane].Altitude)
                 #print(altdiff)
                 #Should we have alarm level highest with least distance
-                if int(pflaa.AlarmLevel) > int(pflau.AlarmLevel) or int(DISTANCE[plane]) < int(pflau.RelativeDistance):
+                if (int(pflaa.AlarmLevel) > int(pflau.AlarmLevel)) or (int(pflaa.AlarmLevel) == int(pflau.AlarmLevel) and int(DISTANCE[plane][0]) < int(pflau.RelativeDistance)):
                     #Right order!
                     result = Geodesic.WGS84.Inverse(My.Lat,My.Long,Lat,Long)
                     bearing = result["azi1"] # in [°] (degrees)
@@ -473,18 +489,17 @@ def FlarmCalc():
                     pflau.RelativeBearing=int(round(bearing,0))
                     pflau.AlarmType=2
                     pflau.RelativeVertical=altdiff
-                    pflau.RelativeDistance=int(DISTANCE[plane])
+                    pflau.RelativeDistance=int(DISTANCE[plane][0])
                     pflau.ID=pflaa.ID
                 CloseFlarm.append(plane)
                 FLARMDATA.update({plane:pflaa})
                 pflau.RX=len(CloseFlarm)
                 #Debug, check number of elements in PFLAU. should be 10
-   
-    
+#   
+# Main
+#
 My=GPS()
 pflau=PFLAU()
-
-
 while True:
     GetADSBData()
     time.sleep(0.001)
@@ -500,11 +515,7 @@ while True:
         FlarmCalc()
         xcsoaru2000.sendto((str(pflau)).encode(),(XCHost, XCPort))
         for plane in CloseFlarm:
-            xcsoaru2000.sendto(str(FLARMDATA[plane]).encode(),('127.0.0.1', 2000))
+            xcsoaru2000.sendto(str(FLARMDATA[plane]).encode(),(XCHost, XCPort))
         #sendPFLAA()
         if not adsbConnected:
             xcsoaru2000.sendto(("Waiting for adsb data. No connection."+'\r\n').encode(),(XCHost, XCPort))
-
-
-
-
